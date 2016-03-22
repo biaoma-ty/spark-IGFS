@@ -20,37 +20,34 @@ package org.apache.spark.util
 import java.io.File
 import java.util.PriorityQueue
 
-import scala.util.{Failure, Success, Try}
+import org.apache.hadoop.fs.FileSystem
+import org.apache.ignite.igfs.IgfsPath
+import org.apache.spark.Logging
 import tachyon.client.TachyonFile
 
-import org.apache.hadoop.fs.FileSystem
-import org.apache.spark.Logging
+import scala.util.{Failure, Success, Try}
 
 /**
  * Various utility methods used by Spark.
  */
 private[spark] object ShutdownHookManager extends Logging {
+  private lazy val shutdownHooks = {
+    val manager = new SparkShutdownHookManager()
+    manager.install()
+    manager
+  }
   val DEFAULT_SHUTDOWN_PRIORITY = 100
-
   /**
    * The shutdown priority of the SparkContext instance. This is lower than the default
    * priority, so that by default hooks are run before the context is shut down.
    */
   val SPARK_CONTEXT_SHUTDOWN_PRIORITY = 50
-
   /**
    * The shutdown priority of temp directory must be lower than the SparkContext shutdown
    * priority. Otherwise cleaning the temp directories while Spark jobs are running can
    * throw undesirable errors at the time of shutdown.
    */
   val TEMP_DIR_SHUTDOWN_PRIORITY = 25
-
-  private lazy val shutdownHooks = {
-    val manager = new SparkShutdownHookManager()
-    manager.install()
-    manager
-  }
-
   private val shutdownDeletePaths = new scala.collection.mutable.HashSet[String]()
   private val shutdownDeleteTachyonPaths = new scala.collection.mutable.HashSet[String]()
 
@@ -82,6 +79,14 @@ private[spark] object ShutdownHookManager extends Logging {
     val absolutePath = tachyonfile.getPath()
     shutdownDeleteTachyonPaths.synchronized {
       shutdownDeleteTachyonPaths += absolutePath
+    }
+  }
+
+  // Register the tachyon path to be deleted via shutdown hook
+  def registerShutdownDeleteDir(igfsFile: IgfsPath) {
+    val absolutePath = igfsFile.name()
+    shutdownDeletePaths.synchronized {
+      shutdownDeletePaths.remove(absolutePath)
     }
   }
 
@@ -131,6 +136,10 @@ private[spark] object ShutdownHookManager extends Logging {
       logInfo("path = " + file + ", already present as root for deletion.")
     }
     retval
+  }
+
+  def hasRootAsShutdownDeleteDir(file: Int): Boolean = {
+    false
   }
 
   // Note: if file is child of some registered path, while not equal to it, then return true;

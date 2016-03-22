@@ -362,16 +362,6 @@
       <artifactId>ignite-core</artifactId>
       <version>1.5.0.final</version>
     </dependency>
-    <dependency>
-      <groupId>org.apache.ignite</groupId>
-      <artifactId>ignite-spark_2.10</artifactId>
-      <version>1.5.0.final</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.ignite</groupId>
-      <artifactId>ignite-spark</artifactId>
-      <version>1.5.0.final</version>
-    </dependency>
   </dependencies>
   <build>
     <outputDirectory>target/scala-${scala.binary.version}/classes</outputDirectory>

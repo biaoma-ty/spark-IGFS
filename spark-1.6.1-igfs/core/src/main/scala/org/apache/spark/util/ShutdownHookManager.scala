@@ -21,7 +21,7 @@ import java.io.File
 import java.util.PriorityQueue
 
 import org.apache.hadoop.fs.FileSystem
-import org.apache.ignite.igfs.IgfsPath
+import org.apache.ignite.igfs.IgfsFile
 import org.apache.spark.Logging
 import tachyon.client.TachyonFile
 
@@ -83,8 +83,8 @@ private[spark] object ShutdownHookManager extends Logging {
   }
 
   // Register the tachyon path to be deleted via shutdown hook
-  def registerShutdownDeleteDir(igfsFile: IgfsPath) {
-    val absolutePath = igfsFile.name()
+  def registerShutdownDeleteDir(igfsFile: IgfsFile) {
+    val absolutePath = igfsFile.path().name()
     shutdownDeletePaths.synchronized {
       shutdownDeletePaths.remove(absolutePath)
     }

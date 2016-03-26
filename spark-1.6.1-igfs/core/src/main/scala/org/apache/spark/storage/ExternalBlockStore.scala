@@ -19,10 +19,10 @@ package org.apache.spark.storage
 
 import java.nio.ByteBuffer
 
-import scala.util.control.NonFatal
-
 import org.apache.spark.Logging
 import org.apache.spark.util.{ShutdownHookManager, Utils}
+
+import scala.util.control.NonFatal
 
 
 /**
@@ -37,71 +37,14 @@ private[spark] class ExternalBlockStore(blockManager: BlockManager, executorId: 
 
   logInfo("ExternalBlockStore started")
 
-  override def getSize(blockId: BlockId): Long = {
-    try {
-      externalBlockManager.map(_.getSize(blockId)).getOrElse(0)
-    } catch {
-      case NonFatal(t) =>
-        logError(s"Error in getSize($blockId)", t)
-        0L
-    }
-  }
-
   override def putBytes(blockId: BlockId, bytes: ByteBuffer, level: StorageLevel): PutResult = {
     putIntoExternalBlockStore(blockId, bytes, returnValues = true)
   }
 
-  override def putArray(
-      blockId: BlockId,
-      values: Array[Any],
-      level: StorageLevel,
-      returnValues: Boolean): PutResult = {
-    putIntoExternalBlockStore(blockId, values.toIterator, returnValues)
-  }
-
-  override def putIterator(
-      blockId: BlockId,
-      values: Iterator[Any],
-      level: StorageLevel,
-      returnValues: Boolean): PutResult = {
-    putIntoExternalBlockStore(blockId, values, returnValues)
-  }
-
   private def putIntoExternalBlockStore(
-      blockId: BlockId,
-      values: Iterator[_],
-      returnValues: Boolean): PutResult = {
-    logTrace(s"Attempting to put block $blockId into ExternalBlockStore")
-    // we should never hit here if externalBlockManager is None. Handle it anyway for safety.
-    try {
-      val startTime = System.currentTimeMillis
-      if (externalBlockManager.isDefined) {
-        externalBlockManager.get.putValues(blockId, values)
-        val size = getSize(blockId)
-        val data = if (returnValues) {
-          Left(getValues(blockId).get)
-        } else {
-          null
-        }
-        val finishTime = System.currentTimeMillis
-        logDebug("Block %s stored as %s file in ExternalBlockStore in %d ms".format(
-          blockId, Utils.bytesToString(size), finishTime - startTime))
-        PutResult(size, data)
-      } else {
-        logError(s"Error in putValues($blockId): no ExternalBlockManager has been configured")
-        PutResult(-1, null, Seq((blockId, BlockStatus.empty)))
-      }
-    } catch {
-      case NonFatal(t) =>
-        logError(s"Error in putValues($blockId)", t)
-        PutResult(-1, null, Seq((blockId, BlockStatus.empty)))
-    }
-  }
-
-  private def putIntoExternalBlockStore(
-      blockId: BlockId,
-      bytes: ByteBuffer,
-      returnValues: Boolean): PutResult = {
+                                         blockId: BlockId,
+                                         bytes: ByteBuffer,
+                                         returnValues: Boolean): PutResult = {
     logTrace(s"Attempting to put block $blockId into ExternalBlockStore")
     // we should never hit here if externalBlockManager is None. Handle it anyway for safety.
     try {
@@ -131,14 +74,52 @@ private[spark] class ExternalBlockStore(blockManager: BlockManager, executorId: 
     }
   }
 
-  // We assume the block is removed even if exception thrown
-  override def remove(blockId: BlockId): Boolean = {
+  override def putArray(
+                         blockId: BlockId,
+                         values: Array[Any],
+                         level: StorageLevel,
+                         returnValues: Boolean): PutResult = {
+    putIntoExternalBlockStore(blockId, values.toIterator, returnValues)
+  }
+
+  private def putIntoExternalBlockStore(
+                                         blockId: BlockId,
+                                         values: Iterator[_],
+                                         returnValues: Boolean): PutResult = {
+    logTrace(s"Attempting to put block $blockId into ExternalBlockStore")
+    // we should never hit here if externalBlockManager is None. Handle it anyway for safety.
     try {
-      externalBlockManager.map(_.removeBlock(blockId)).getOrElse(true)
+      val startTime = System.currentTimeMillis
+      if (externalBlockManager.isDefined) {
+        externalBlockManager.get.putValues(blockId, values)
+        val size = getSize(blockId)
+        val data = if (returnValues) {
+          Left(getValues(blockId).get)
+        } else {
+          null
+        }
+        val finishTime = System.currentTimeMillis
+        logDebug("Block %s stored as %s file in ExternalBlockStore in %d ms".format(
+          blockId, Utils.bytesToString(size), finishTime - startTime))
+        PutResult(size, data)
+      } else {
+        logError(s"Error in putValues($blockId): no ExternalBlockManager has been configured")
+        PutResult(-1, null, Seq((blockId, BlockStatus.empty)))
+      }
     } catch {
       case NonFatal(t) =>
-        logError(s"Error in removeBlock($blockId)", t)
-        true
+        logError(s"Error in putValues($blockId)", t)
+        PutResult(-1, null, Seq((blockId, BlockStatus.empty)))
+    }
+  }
+
+  override def getSize(blockId: BlockId): Long = {
+    try {
+      externalBlockManager.map(_.getSize(blockId)).getOrElse(0)
+    } catch {
+      case NonFatal(t) =>
+        logError(s"Error in getSize($blockId)", t)
+        0L
     }
   }
 
@@ -149,6 +130,25 @@ private[spark] class ExternalBlockStore(blockManager: BlockManager, executorId: 
       case NonFatal(t) =>
         logError(s"Error in getValues($blockId)", t)
         None
+    }
+  }
+
+  override def putIterator(
+                            blockId: BlockId,
+                            values: Iterator[Any],
+                            level: StorageLevel,
+                            returnValues: Boolean): PutResult = {
+    putIntoExternalBlockStore(blockId, values, returnValues)
+  }
+
+  // We assume the block is removed even if exception thrown
+  override def remove(blockId: BlockId): Boolean = {
+    try {
+      externalBlockManager.map(_.removeBlock(blockId)).getOrElse(true)
+    } catch {
+      case NonFatal(t) =>
+        logError(s"Error in removeBlock($blockId)", t)
+        true
     }
   }
 
@@ -179,8 +179,14 @@ private[spark] class ExternalBlockStore(blockManager: BlockManager, executorId: 
 
   // Create concrete block manager and fall back to Tachyon by default for backward compatibility.
   private def createBlkManager(): Option[ExternalBlockManager] = {
-    val clsName = blockManager.conf.getOption(ExternalBlockStore.BLOCK_MANAGER_NAME)
+    var clsName = blockManager.conf.getOption(ExternalBlockStore.BLOCK_MANAGER_NAME)
       .getOrElse(ExternalBlockStore.DEFAULT_BLOCK_MANAGER_NAME)
+
+    if (blockManager.conf.getOption(ExternalBlockStore.BLOCK_MANAGER_NAME) ==
+      ExternalBlockStore.IGFS_BLOCK_MANAGER_NAME) {
+      clsName = blockManager.conf.getOption(ExternalBlockStore.BLOCK_MANAGER_NAME)
+        .getOrElse(ExternalBlockStore.IGFS_BLOCK_MANAGER_NAME)
+    }
 
     try {
       val instance = Utils.classForName(clsName)
@@ -208,4 +214,5 @@ private[spark] object ExternalBlockStore extends Logging {
   val MASTER_URL = "spark.externalBlockStore.url"
   val BLOCK_MANAGER_NAME = "spark.externalBlockStore.blockManager"
   val DEFAULT_BLOCK_MANAGER_NAME = "org.apache.spark.storage.TachyonBlockManager"
+  val IGFS_BLOCK_MANAGER_NAME = "org.apache.spark.storage.IgfsBlockManager"
 }

@@ -23,7 +23,10 @@ import java.text.SimpleDateFormat
 import java.util.{Date, Random}
 
 import com.google.common.io.ByteStreams
+import org.apache.ignite.configuration.{FileSystemConfiguration, IgniteConfiguration}
 import org.apache.ignite.igfs.{IgfsFile, IgfsPath}
+import org.apache.ignite.spi.discovery.tcp.TcpDiscoverySpi
+import org.apache.ignite.spi.discovery.tcp.ipfinder.vm.TcpDiscoveryVmIpFinder
 import org.apache.ignite.{IgniteFileSystem, Ignition}
 import org.apache.spark.Logging
 import org.apache.spark.executor.ExecutorExitCode
@@ -56,29 +59,56 @@ private[spark] class IgfsBlockManager() extends ExternalBlockManager with Loggin
     val storeDir = blockManager.conf.get(ExternalBlockStore.BASE_DIR, "/tmp_spark_igfs")
     val appFolderName = blockManager.conf.get(ExternalBlockStore.FOLD_NAME)
 
+    val igniteConfig = new IgniteConfiguration()
+    val disoSpi = new TcpDiscoverySpi()
+    disoSpi.setIpFinder(new TcpDiscoveryVmIpFinder(true))
+    igniteConfig.setDiscoverySpi(disoSpi)
+    igniteConfig.setCacheConfiguration()
+    val igfsConfig = new FileSystemConfiguration()
+
+    igfsConfig.setName("igfs")
+    igfsConfig.setDataCacheName("igfsDatacache")
+    igfsConfig.setMetaCacheName("igfsMetacache")
+    igniteConfig.setFileSystemConfiguration(igfsConfig)
+    igniteConfig.setLocalHost("127.0.0.1")
+
     rootDirs = s"$storeDir/$appFolderName/$executorId"
-    master = blockManager.conf.get(ExternalBlockStore.MASTER_URL, "igfs:///")
+    master = blockManager.conf.get(ExternalBlockStore.MASTER_URL, "localhost:10500")
     client = if (master != null && master != "") {
-      val ignite = Ignition.ignite();
-      ignite.fileSystem("spark-igfs")
+      Ignition.start("/home/com/workspace/apache-ignite-1.5.0.final-src/config/default-config.xml")
+      val ignite = Ignition.ignite()
+      //    ignite.addCacheConfiguration(cacheConfig)
+      val cachecfg = ignite.configuration().getCacheConfiguration
+      if (cachecfg != null) {
+        logInfo(s"BM@IgfsBlockManager cache set success")
+
+      }
+      logInfo(s"BM@IgfsBlockManager cache name")
+      ignite.fileSystem("igniteFileSystem")
+
     } else {
       null
+
     }
+
     // original implementation call System.exit, we change it to run without extblkstore support
     if (client == null) {
       logError("Failed to connect to the Igfs as the master address is not configured")
       throw new IOException("Failed to connect to the Igfs as the master " +
         "address is not configured")
+
     }
     subDirsPerIgfsDir = blockManager.conf.get("spark.externalBlockStore.subDirectories",
       ExternalBlockStore.SUB_DIRS_PER_DIR).toInt
 
-    // Create one Tachyon directory for each path mentioned in spark.tachyonStore.folderName;
+    // Create one Igfs directory for each path mentioned in spark.tachyonStore.folderName;
     // then, inside this directory, create multiple subdirectories that we will hash files into,
     // in order to avoid having really large inodes at the top level in Tachyon.
     igfsDirs = createIgfsDirs()
     subDirs = Array.fill(igfsDirs.length)(new Array[IgfsFile](subDirsPerIgfsDir))
     igfsDirs.foreach(igfsDir => ShutdownHookManager.registerShutdownDeleteDir(igfsDir))
+    logInfo("Igfs init finished")
+
   }
 
   // TODO: Some of the logic here could be consolidated/de-duplicated with that in the DiskStore.
@@ -100,44 +130,141 @@ private[spark] class IgfsBlockManager() extends ExternalBlockManager with Loggin
             client.mkdirs(path)
             foundLocalDir = client.exists(path)
             igfsDir = client.info(path)
+
           }
+
         } catch {
           case NonFatal(e) =>
             logWarning(s"Attempt ${tries}s to create igfs dir $igfsDir failed", e)
+
         }
+
       }
       if (!foundLocalDir) {
         logError(s"Failed ${ExternalBlockStore.MAX_DIR_CREATION_ATTEMPTS}"
           + s" attempts to create tachyon dir in $rootDir")
         System.exit(ExecutorExitCode.EXTERNAL_BLOCK_STORE_FAILED_TO_CREATE_DIR)
+
       }
-      logInfo(s"Created tachyon directory at $igfsDir")
+      logInfo(s"Created igfs directory at $igfsDir")
       igfsDir
     }
+
   }
 
   override def toString: String = {
     "ExternalBlockStore-Igfs"
+
   }
 
   override def removeBlock(blockId: BlockId): Boolean = {
     val file = getFile(blockId)
     if (fileExists(file)) {
       removeFile(file)
+
     } else {
       false
+
     }
+
   }
 
   def removeFile(file: IgfsFile): Boolean = {
     client.delete(file.path(), false)
+
+  }
+
+  override def blockExists(blockId: BlockId): Boolean = {
+    val file = getFile(blockId)
+    fileExists(file)
+
   }
 
   def fileExists(file: IgfsFile): Boolean = {
     client.exists(file.path())
+
+  }
+
+  override def putBytes(blockId: BlockId, bytes: ByteBuffer): Unit = {
+    val file = getFile(blockId)
+    val os = client.create(file.path(), false)
+    try {
+      os.write(bytes.array())
+
+    } catch {
+      case NonFatal(e) =>
+        logWarning(s"Failed to put bytes of block $blockId into Igfs", e)
+        os.close()
+
+    } finally {
+      os.close()
+
+    }
+
+  }
+
+  override def putValues(blockId: BlockId, values: Iterator[_]): Unit = {
+    val file = getFile(blockId)
+    val os = client.create(file.path(), false)
+    try {
+      blockManager.dataSerializeStream(blockId, os, values)
+
+    } catch {
+      case NonFatal(e) =>
+        logWarning(s"Failed to put values of block $blockId into Tachyon", e)
+        os.close()
+
+    } finally {
+      os.close()
+
+    }
+
   }
 
   def getFile(blockId: BlockId): IgfsFile = getFile(blockId.name)
+
+  override def getBytes(blockId: BlockId): Option[ByteBuffer] = {
+    val file = getFile(blockId)
+    if (file == null) {
+      return None
+
+    }
+    val is = client.open(file.path())
+    try {
+      val size = file.length
+      val bs = new Array[Byte](size.asInstanceOf[Int])
+      ByteStreams.readFully(is, bs)
+      Some(ByteBuffer.wrap(bs))
+
+    } catch {
+      case NonFatal(e) =>
+        logWarning(s"Failed to get bytes of block $blockId from Igfs", e)
+        None
+
+    } finally {
+      is.close()
+
+    }
+
+  }
+
+  override def getValues(blockId: BlockId): Option[Iterator[_]] = {
+    val file = getFile(blockId)
+    if (file == null) {
+      return None
+
+    }
+    val is = client.open(file.path())
+    Option(is).map { is =>
+      blockManager.dataDeserializeStream(blockId, is)
+    }
+
+  }
+
+  override def getSize(blockId: BlockId): Long = {
+    getFile(blockId.name).length
+
+  }
 
   def getFile(filename: String): IgfsFile = {
     // Figure out which igfs directory it hashes to, and which subdirectory in that
@@ -152,91 +279,30 @@ private[spark] class IgfsBlockManager() extends ExternalBlockManager with Loggin
         val old = subDirs(dirId)(subDirId)
         if (old != null) {
           old
+
         } else {
           val path = new IgfsPath(s"${igfsDirs(dirId)}/${"%02x".format(subDirId)}")
           client.mkdirs(path)
           val newDir = client.info(path)
           subDirs(dirId)(subDirId) = newDir
           newDir
+
         }
+
       }
+
     }
     val filePath = new IgfsPath(s"$subDir/$filename")
 
     if (!client.exists(filePath)) {
-      client.info(IgfsPath)
+      client.info(filePath)
+
     } else {
       logError(s"BM@Igfs can not find file ${filePath.name()}")
       null
-    }
-  }
 
-  override def blockExists(blockId: BlockId): Boolean = {
-    val file = getFile(blockId)
-    fileExists(file)
-  }
+    }
 
-  override def putBytes(blockId: BlockId, bytes: ByteBuffer): Unit = {
-    val file = getFile(blockId)
-    val os = client.create(file.path(), false)
-    try {
-      os.write(bytes.array())
-    } catch {
-      case NonFatal(e) =>
-        logWarning(s"Failed to put bytes of block $blockId into Igfs", e)
-        os.close()
-    } finally {
-      os.close()
-    }
-  }
-
-  override def putValues(blockId: BlockId, values: Iterator[_]): Unit = {
-    val file = getFile(blockId)
-    val os = client.create(file.path(), false)
-    try {
-      blockManager.dataSerializeStream(blockId, os, values)
-    } catch {
-      case NonFatal(e) =>
-        logWarning(s"Failed to put values of block $blockId into Tachyon", e)
-        os.close()
-    } finally {
-      os.close()
-    }
-  }
-
-  override def getBytes(blockId: BlockId): Option[ByteBuffer] = {
-    val file = getFile(blockId)
-    if (file == null) {
-      return None
-    }
-    val is = client.open(file.path())
-    try {
-      val size = file.length
-      val bs = new Array[Byte](size.asInstanceOf[Int])
-      ByteStreams.readFully(is, bs)
-      Some(ByteBuffer.wrap(bs))
-    } catch {
-      case NonFatal(e) =>
-        logWarning(s"Failed to get bytes of block $blockId from Igfs", e)
-        None
-    } finally {
-      is.close()
-    }
-  }
-
-  override def getValues(blockId: BlockId): Option[Iterator[_]] = {
-    val file = getFile(blockId)
-    if (file == null) {
-      return None
-    }
-    val is = client.open(file.path())
-    Option(is).map { is =>
-      blockManager.dataDeserializeStream(blockId, is)
-    }
-  }
-
-  override def getSize(blockId: BlockId): Long = {
-    getFile(blockId.name).length
   }
 
   override def shutdown() {
@@ -245,12 +311,18 @@ private[spark] class IgfsBlockManager() extends ExternalBlockManager with Loggin
       try {
         if (!ShutdownHookManager.hasRootAsShutdownDeleteDir(0)) {
           Utils.deleteRecursively(igfsDir, client)
+
         }
+
       } catch {
         case NonFatal(e) =>
           logError(s"Exception while deleting igfs spark dir: $igfsDir", e)
+
       }
     }
     client = null
+
   }
+
 }
+

@@ -23,10 +23,7 @@ import java.text.SimpleDateFormat
 import java.util.{Date, Random}
 
 import com.google.common.io.ByteStreams
-import org.apache.ignite.configuration.{FileSystemConfiguration, IgniteConfiguration}
 import org.apache.ignite.igfs.{IgfsFile, IgfsPath}
-import org.apache.ignite.spi.discovery.tcp.TcpDiscoverySpi
-import org.apache.ignite.spi.discovery.tcp.ipfinder.vm.TcpDiscoveryVmIpFinder
 import org.apache.ignite.{IgniteFileSystem, Ignition}
 import org.apache.spark.Logging
 import org.apache.spark.executor.ExecutorExitCode
@@ -59,24 +56,27 @@ private[spark] class IgfsBlockManager() extends ExternalBlockManager with Loggin
     val storeDir = blockManager.conf.get(ExternalBlockStore.BASE_DIR, "/tmp_spark_igfs")
     val appFolderName = blockManager.conf.get(ExternalBlockStore.FOLD_NAME)
 
-    val igniteConfig = new IgniteConfiguration()
-    val disoSpi = new TcpDiscoverySpi()
-    disoSpi.setIpFinder(new TcpDiscoveryVmIpFinder(true))
-    igniteConfig.setDiscoverySpi(disoSpi)
-    igniteConfig.setCacheConfiguration()
-    val igfsConfig = new FileSystemConfiguration()
+    //    val igniteConf = new IgniteConfiguration()
 
-    igfsConfig.setName("igfs")
-    igfsConfig.setDataCacheName("igfsDatacache")
-    igfsConfig.setMetaCacheName("igfsMetacache")
-    igniteConfig.setFileSystemConfiguration(igfsConfig)
-    igniteConfig.setLocalHost("127.0.0.1")
+    //    val igfsConf = new FileSystemConfiguration()
+    //    igfsConf.setDataCacheName("spark-igfs-data")
+    //    igfsConf.setMetaCacheName("spark-igfs-meta")
+    //    igfsConf.setName("spark-igfs")
+    //    igfsConf.setDefaultMode(IgfsMode.PRIMARY)
+
+    //    val igfsIpcConf = new IgfsIpcEndpointConfiguration()
+    //    igfsIpcConf.setHost("localhost")
+    //    igfsIpcConf.setPort(10500)
+    //
+    //    igfsConf.setIpcEndpointConfiguration(igfsIpcConf)
+    //    igniteConf.setFileSystemConfiguration(igfsConf)
+
+    //    val cacheConfig = new CacheConfiguration("ignite-cache")
 
     rootDirs = s"$storeDir/$appFolderName/$executorId"
     master = blockManager.conf.get(ExternalBlockStore.MASTER_URL, "localhost:10500")
     client = if (master != null && master != "") {
-      Ignition.start("/home/com/workspace/apache-ignite-1.5.0.final-src/config/default-config.xml")
-      val ignite = Ignition.ignite()
+      val ignite = Ignition.start("core/igfs-spark.xml")
       //    ignite.addCacheConfiguration(cacheConfig)
       val cachecfg = ignite.configuration().getCacheConfiguration
       if (cachecfg != null) {
@@ -84,7 +84,7 @@ private[spark] class IgfsBlockManager() extends ExternalBlockManager with Loggin
 
       }
       logInfo(s"BM@IgfsBlockManager cache name")
-      ignite.fileSystem("igniteFileSystem")
+      ignite.fileSystem("igfs")
 
     } else {
       null
@@ -101,7 +101,7 @@ private[spark] class IgfsBlockManager() extends ExternalBlockManager with Loggin
     subDirsPerIgfsDir = blockManager.conf.get("spark.externalBlockStore.subDirectories",
       ExternalBlockStore.SUB_DIRS_PER_DIR).toInt
 
-    // Create one Igfs directory for each path mentioned in spark.tachyonStore.folderName;
+    // Create one Tachyon directory for each path mentioned in spark.tachyonStore.folderName;
     // then, inside this directory, create multiple subdirectories that we will hash files into,
     // in order to avoid having really large inodes at the top level in Tachyon.
     igfsDirs = createIgfsDirs()
@@ -174,14 +174,14 @@ private[spark] class IgfsBlockManager() extends ExternalBlockManager with Loggin
 
   }
 
-  override def blockExists(blockId: BlockId): Boolean = {
-    val file = getFile(blockId)
-    fileExists(file)
+  def fileExists(file: IgfsFile): Boolean = {
+    client.exists(file.path())
 
   }
 
-  def fileExists(file: IgfsFile): Boolean = {
-    client.exists(file.path())
+  override def blockExists(blockId: BlockId): Boolean = {
+    val file = getFile(blockId)
+    fileExists(file)
 
   }
 
@@ -198,6 +198,47 @@ private[spark] class IgfsBlockManager() extends ExternalBlockManager with Loggin
 
     } finally {
       os.close()
+
+    }
+
+  }
+
+  def getFile(blockId: BlockId): IgfsFile = getFile(blockId.name)
+
+  def getFile(filename: String): IgfsFile = {
+    // Figure out which igfs directory it hashes to, and which subdirectory in that
+    val hash = Utils.nonNegativeHash(filename)
+    val dirId = hash % igfsDirs.length
+    val subDirId = (hash / igfsDirs.length) % subDirsPerIgfsDir
+
+    // Create the subdirectory if it doesn't already exist
+    var subDir = subDirs(dirId)(subDirId)
+    if (subDir == null) {
+      subDir = subDirs(dirId).synchronized {
+        val old = subDirs(dirId)(subDirId)
+        if (old != null) {
+          old
+
+        } else {
+          val path = new IgfsPath(s"${igfsDirs(dirId)}/${"%02x".format(subDirId)}")
+          client.mkdirs(path)
+          val newDir = client.info(path)
+          subDirs(dirId)(subDirId) = newDir
+          newDir
+
+        }
+
+      }
+
+    }
+    val filePath = new IgfsPath(s"$subDir/$filename")
+
+    if (!client.exists(filePath)) {
+      client.info(filePath)
+
+    } else {
+      logError(s"BM@Igfs can not find file ${filePath.name()}")
+      null
 
     }
 
@@ -220,8 +261,6 @@ private[spark] class IgfsBlockManager() extends ExternalBlockManager with Loggin
     }
 
   }
-
-  def getFile(blockId: BlockId): IgfsFile = getFile(blockId.name)
 
   override def getBytes(blockId: BlockId): Option[ByteBuffer] = {
     val file = getFile(blockId)
@@ -263,45 +302,6 @@ private[spark] class IgfsBlockManager() extends ExternalBlockManager with Loggin
 
   override def getSize(blockId: BlockId): Long = {
     getFile(blockId.name).length
-
-  }
-
-  def getFile(filename: String): IgfsFile = {
-    // Figure out which igfs directory it hashes to, and which subdirectory in that
-    val hash = Utils.nonNegativeHash(filename)
-    val dirId = hash % igfsDirs.length
-    val subDirId = (hash / igfsDirs.length) % subDirsPerIgfsDir
-
-    // Create the subdirectory if it doesn't already exist
-    var subDir = subDirs(dirId)(subDirId)
-    if (subDir == null) {
-      subDir = subDirs(dirId).synchronized {
-        val old = subDirs(dirId)(subDirId)
-        if (old != null) {
-          old
-
-        } else {
-          val path = new IgfsPath(s"${igfsDirs(dirId)}/${"%02x".format(subDirId)}")
-          client.mkdirs(path)
-          val newDir = client.info(path)
-          subDirs(dirId)(subDirId) = newDir
-          newDir
-
-        }
-
-      }
-
-    }
-    val filePath = new IgfsPath(s"$subDir/$filename")
-
-    if (!client.exists(filePath)) {
-      client.info(filePath)
-
-    } else {
-      logError(s"BM@Igfs can not find file ${filePath.name()}")
-      null
-
-    }
 
   }
 
